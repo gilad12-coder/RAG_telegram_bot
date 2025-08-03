@@ -40,6 +40,8 @@ TEMPERATURE: float = 0.1
 MAX_TG_LEN: int = 4096
 MAX_TURNS: int = 16
 MAX_HISTORY_CHARS: int = 16000
+DISPLAY_BUDGET: int = MAX_TG_LEN - 50
+STREAM_EDIT_INTERVAL_SEC: float = 1.0
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
     logger.critical("Missing TELEGRAM_BOT_TOKEN or GEMINI_API_KEY")
@@ -229,41 +231,23 @@ async def answer_question(chat_id: int, question: str) -> str:
     try:
         file_uri, mime_type = _ensure_file_uploaded()
         contents = _build_contents_for_chat(chat_id, question, file_uri, mime_type)
-        try:
-            response = await asyncio.wait_for(
-                genai_client.aio.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        temperature=TEMPERATURE,
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        response_mime_type="text/plain",
-                    ),
-                ),
-                timeout=20.0,
-            )
-        except asyncio.TimeoutError:
-            dt = (time.monotonic() - t0) * 1000.0
-            logger.warning(f"[{req_id}] Generation timed out after {dt:.0f} ms")
-            return "המענה מתעכב לרגע. אנא נסה שוב בעוד מספר שניות."
+        response = await genai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=TEMPERATURE,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+                response_mime_type="text/plain",
+            ),
+        )
         answer: str = _extract_text_from_response(response) or "לא הצלחתי למצוא תשובה לשאלתך בספר. ייתכן שהמידע אינו קיים או שהשאלה אינה ברורה מספיק."
         hist = _get_history(chat_id)
         hist.append({"role": "user", "text": question})
         hist.append({"role": "assistant", "text": answer})
         dt_ms: float = (time.monotonic() - t0) * 1000.0
-        usage = getattr(response, "usage_metadata", None)
-        usage_dict: Dict[str, Any] = {}
-        if usage:
-            for k in ("input_tokens", "output_tokens", "total_tokens", "prompt_token_count", "candidates_token_count", "total_token_count"):
-                if hasattr(usage, k):
-                    usage_dict[k] = getattr(usage, k)
-        cand_count = len(getattr(response, "candidates", []) or [])
-        finish_reason = None
-        if cand_count:
-            finish_reason = getattr(response.candidates[0], "finish_reason", None)
         preview = (answer.replace("\n", " ")[:200] + ("…" if len(answer) > 200 else ""))
-        logger.info(f"[{req_id}] OK model={GEMINI_MODEL} latency_ms={dt_ms:.0f} tokens={usage_dict or '-'} candidates={cand_count} finish={finish_reason} hist_len={len(hist)} preview={preview!r}")
+        logger.info(f"[{req_id}] OK latency_ms={dt_ms:.0f} preview={preview!r}")
         logger.debug(f"[{req_id}] FULL_ANSWER:\n{answer}")
         return answer
     except FileNotFoundError:
@@ -319,6 +303,44 @@ async def _typing_pinger(chat_id: int, stop: asyncio.Event) -> None:
         await asyncio.sleep(4.0)
 
 
+async def stream_answer(chat_id: int, question: str, placeholder_id: int) -> str:
+    """Streams model output, periodically editing the placeholder message; returns the final answer."""
+    req_id: str = uuid.uuid4().hex[:8]
+    t0: float = time.monotonic()
+    logger.info(f"[{req_id}] stream start chat_id={chat_id} q={question!r}")
+    file_uri, mime_type = _ensure_file_uploaded()
+    contents = _build_contents_for_chat(chat_id, question, file_uri, mime_type)
+    stream = await genai_client.aio.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=TEMPERATURE,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            response_mime_type="text/plain",
+        ),
+    )
+    buf: List[str] = []
+    last_edit: float = 0.0
+    async for chunk in stream:
+        piece: str = (getattr(chunk, "text", "") or "")
+        if not piece:
+            continue
+        buf.append(piece)
+        now = time.monotonic()
+        if now - last_edit >= STREAM_EDIT_INTERVAL_SEC:
+            current: str = "".join(buf)
+            await edit_message_text(chat_id, placeholder_id, current[:DISPLAY_BUDGET])
+            last_edit = now
+    final_answer: str = "".join(buf).strip()
+    if not final_answer:
+        final_answer = "לא הצלחתי למצוא תשובה לשאלתך בספר. ייתכן שהמידע אינו קיים או שהשאלה אינה ברורה מספיק."
+    dt_ms: float = (time.monotonic() - t0) * 1000.0
+    preview = (final_answer.replace("\n", " ")[:200] + ("…" if len(final_answer) > 200 else ""))
+    logger.info(f"[{req_id}] stream done latency_ms={dt_ms:.0f} preview={preview!r}")
+    return final_answer
+
+
 async def handle_update(chat_id: int, text: str) -> None:
     """Handles a user update with acknowledgment, progress feedback, conversational answer, and delivery."""
     req: str = os.urandom(3).hex()
@@ -327,12 +349,15 @@ async def handle_update(chat_id: int, text: str) -> None:
     stop = asyncio.Event()
     pinger = asyncio.create_task(_typing_pinger(chat_id, stop))
     try:
-        answer: str = await answer_question(chat_id, text)
-        chunks: List[str] = _chunk(answer, MAX_TG_LEN - 50) or ["לא הצלחתי להפיק תשובה."]
-        await edit_message_text(chat_id, placeholder_id, chunks[0])
-        for extra in chunks[1:]:
-            await send_message(chat_id, extra)
-        logger.info(f"[{req}] handle_update done; sent {len(chunks)} message(s)")
+        answer: str = await stream_answer(chat_id, text, placeholder_id)
+        hist = _get_history(chat_id)
+        hist.append({"role": "user", "text": text})
+        hist.append({"role": "assistant", "text": answer})
+        await edit_message_text(chat_id, placeholder_id, answer[:DISPLAY_BUDGET])
+        if len(answer) > DISPLAY_BUDGET:
+            for extra in _chunk(answer[DISPLAY_BUDGET:], MAX_TG_LEN - 50):
+                await send_message(chat_id, extra)
+        logger.info(f"[{req}] handle_update done; total_len={len(answer)}")
     except Exception as e:
         logger.error(f"[{req}] handle_update failed: {e}", exc_info=True)
         with contextlib.suppress(Exception):
