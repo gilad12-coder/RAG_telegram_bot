@@ -23,11 +23,11 @@ load_dotenv()
 BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-PDF_PATH: str = os.getenv("PDF_PATH", "./doc.pdf")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8080"))
 RELOAD: bool = os.getenv("RELOAD", "false").lower() in ("true", "1", "yes")
+PDF_PATH: str = "./guide_HR.pdf"
 
 FILE_CACHE_HOURS = 24
 HTTP_TIMEOUT = 15.0
