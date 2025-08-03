@@ -6,8 +6,9 @@ import uuid
 import asyncio
 import logging
 import contextlib
+from collections import deque
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Deque
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -37,6 +38,8 @@ HTTP_TIMEOUT: float = 15.0
 MAX_OUTPUT_TOKENS: int = 8192
 TEMPERATURE: float = 0.1
 MAX_TG_LEN: int = 4096
+MAX_TURNS: int = 16
+MAX_HISTORY_CHARS: int = 16000
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
     logger.critical("Missing TELEGRAM_BOT_TOKEN or GEMINI_API_KEY")
@@ -44,17 +47,58 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
 
 TELEGRAM_API_BASE: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-SYSTEM_PROMPT: str = (
-    "אתה 'המסייע המשאני', בוט מידע של חיל משאבי האנוש בצה\"ל. "
-    "תפקידך הוא לענות על שאלות אך ורק על סמך המידע מספר 'ניהול משרד המשא\"ן בשגרה' המצורף. "
-    "התשובות שלך צריכות להיות מדויקות, תמציתיות, וכתובות בעברית תקנית. "
-    "אם המידע אינו נמצא במסמך, עליך לציין זאת במפורש ולומר: 'המידע המבוקש אינו מופיע בספר'. "
-    "במידת האפשר, שלב בתשובתך ציטוט קצר ורלוונטי מהמסמך במרכאות."
-)
+SYSTEM_PROMPT = """
+אתה 'המסייע המש״אני' - מערכת סיוע למש"קים/ות משאבי אנוש בצה"ל.
+
+## מקור הידע היחיד:
+הספר 'ניהול משרד המשא"ן בשגרה' המצורף - זהו המקור היחיד שממנו תענה.
+
+## כללי תשובה מחייבים:
+
+### מקור המידע:
+ענה אך ורק ממה שכתוב בספר המצורף
+אם המידע לא מופיע בספר: אמור "המידע אינו מופיע בספר המצורף"
+אסור להוסיף מידע כללי או הנחות - רק מה שכתוב מפורשות
+צטט תמיד את מיקום המידע: [פרק X, עמ' Y]
+
+### מבנה התשובה:
+הליכים: הצג בשלבים ממוספרים (1, 2, 3...)
+רשימות: השתמש בתבליטים
+ציטוט: העתק ניסוח מדויק מהספר כשרלוונטי
+
+### סגנון:
+תמציתי וברור - ישר לעניין
+עברית תקנית ומקצועית
+פנייה ישירה (גוף שני)
+
+### כשחסר מידע:
+אם השאלה על נושא שלא בספר: "נושא זה אינו מכוסה בספר"
+אם חסרים פרטים לתשובה מלאה: "בספר מופיע רק: [המידע החלקי שיש]"
+אם צריך הבהרה מהשואל: "לתשובה מדויקת, אנא ציין: [מה חסר]"
+
+### דוגמת תשובה:
+שאלה: "איך מעדכנים חופשה?"
+תשובה: "לפי הספר [פרק 3, עמ' 22]:
+1. פתח את מערכת X
+2. בחר 'עדכון חופשות'
+3. הזן מספר אישי
+4. מלא את הפרטים הנדרשים
+5. שמור
+
+הערה: לחופשות מיוחדות יש נוהל נוסף [עמ' 23]"
+
+## חשוב:
+אין לענות מידע כללי על צה"ל או משא"ן שלא מהספר
+אין להמציא או להניח נהלים
+חובה לציין כשמידע לא מופיע בספר
+
+התפקיד: לספק מידע מדויק ואמין רק מהספר המצורף לסיוע בעבודה היומיומית.
+"""
 
 genai_client: genai.Client = genai.Client(api_key=GEMINI_API_KEY)
 _uploaded_file: Dict[str, Any] = {"uri": None, "mime": None, "ts": 0.0}
 http_client: Optional[httpx.AsyncClient] = None
+chat_histories: Dict[int, Deque[Dict[str, str]]] = {}
 
 
 def _extract_text_from_response(resp: Any) -> str:
@@ -116,6 +160,43 @@ def _ensure_file_uploaded() -> Tuple[str, str]:
         raise RuntimeError(f"כשל בהעלאת קובץ ה-PDF: {e}")
 
 
+def _get_history(chat_id: int) -> Deque[Dict[str, str]]:
+    """Returns a bounded deque for a chat's turn-by-turn history."""
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = deque(maxlen=MAX_TURNS * 2)
+    return chat_histories[chat_id]
+
+
+def _prune_history_by_chars(hist: Deque[Dict[str, str]]) -> None:
+    """Prunes history to keep total characters under the configured cap."""
+    total = sum(len(h["text"]) for h in hist)
+    while total > MAX_HISTORY_CHARS and hist:
+        dropped = hist.popleft()
+        total -= len(dropped["text"])
+
+
+def _build_contents_for_chat(chat_id: int, question: str, file_uri: str, mime_type: str) -> List[types.Content]:
+    """Builds a contents list that includes the PDF context and recent chat turns."""
+    contents: List[types.Content] = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(text="המסמך המצורף הוא מקור הידע הראשי לתשובותיך."),
+                types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
+            ],
+        )
+    ]
+    hist = _get_history(chat_id)
+    _prune_history_by_chars(hist)
+    for turn in hist:
+        role = "user" if turn["role"] == "user" else "model"
+        contents.append(
+            types.Content(role=role, parts=[types.Part.from_text(text=turn["text"])])
+        )
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=question)]))
+    return contents
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initializes shared clients and preloads the PDF; cleans up on shutdown."""
@@ -140,35 +221,36 @@ app: FastAPI = FastAPI(
 )
 
 
-async def answer_question(question: str) -> str:
-    """Generates a Hebrew answer to the question using the uploaded PDF as context."""
+async def answer_question(chat_id: int, question: str) -> str:
+    """Generates an answer using conversation history and the uploaded PDF as context."""
     req_id: str = uuid.uuid4().hex[:8]
     t0: float = time.monotonic()
-    logger.info(f"[{req_id}] Q received: {question!r}")
+    logger.info(f"[{req_id}] Q chat_id={chat_id} received: {question!r}")
     try:
         file_uri, mime_type = _ensure_file_uploaded()
+        contents = _build_contents_for_chat(chat_id, question, file_uri, mime_type)
         try:
             response = await asyncio.wait_for(
                 genai_client.aio.models.generate_content(
                     model=GEMINI_MODEL,
-                    contents=[
-                        types.Part.from_text(text=SYSTEM_PROMPT),
-                        types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
-                        types.Part.from_text(text=f"שאלה: {question}"),
-                    ],
+                    contents=contents,
                     config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
                         temperature=TEMPERATURE,
                         max_output_tokens=MAX_OUTPUT_TOKENS,
                         response_mime_type="text/plain",
                     ),
                 ),
-                timeout=12.0,
+                timeout=20.0,
             )
         except asyncio.TimeoutError:
             dt = (time.monotonic() - t0) * 1000.0
             logger.warning(f"[{req_id}] Generation timed out after {dt:.0f} ms")
             return "המענה מתעכב לרגע. אנא נסה שוב בעוד מספר שניות."
         answer: str = _extract_text_from_response(response) or "לא הצלחתי למצוא תשובה לשאלתך בספר. ייתכן שהמידע אינו קיים או שהשאלה אינה ברורה מספיק."
+        hist = _get_history(chat_id)
+        hist.append({"role": "user", "text": question})
+        hist.append({"role": "assistant", "text": answer})
         dt_ms: float = (time.monotonic() - t0) * 1000.0
         usage = getattr(response, "usage_metadata", None)
         usage_dict: Dict[str, Any] = {}
@@ -178,15 +260,11 @@ async def answer_question(question: str) -> str:
                     usage_dict[k] = getattr(usage, k)
         cand_count = len(getattr(response, "candidates", []) or [])
         finish_reason = None
-        safety = None
         if cand_count:
-            c0 = response.candidates[0]
-            finish_reason = getattr(c0, "finish_reason", None)
-            safety = getattr(c0, "safety_ratings", None)
+            finish_reason = getattr(response.candidates[0], "finish_reason", None)
         preview = (answer.replace("\n", " ")[:200] + ("…" if len(answer) > 200 else ""))
-        logger.info(f"[{req_id}] OK model={GEMINI_MODEL} latency_ms={dt_ms:.0f} tokens={usage_dict or '-'} candidates={cand_count} finish={finish_reason} preview={preview!r}")
+        logger.info(f"[{req_id}] OK model={GEMINI_MODEL} latency_ms={dt_ms:.0f} tokens={usage_dict or '-'} candidates={cand_count} finish={finish_reason} hist_len={len(hist)} preview={preview!r}")
         logger.debug(f"[{req_id}] FULL_ANSWER:\n{answer}")
-        logger.debug(f"[{req_id}] RAW_RESPONSE_META: { _to_jsonable({'usage': usage_dict, 'safety': _to_jsonable(safety)}) }")
         return answer
     except FileNotFoundError:
         logger.error(f"[{req_id}] PDF missing at {PDF_PATH}", exc_info=True)
@@ -242,14 +320,14 @@ async def _typing_pinger(chat_id: int, stop: asyncio.Event) -> None:
 
 
 async def handle_update(chat_id: int, text: str) -> None:
-    """Handles a user update: acknowledges, shows progress, generates, and delivers the final answer."""
+    """Handles a user update with acknowledgment, progress feedback, conversational answer, and delivery."""
     req: str = os.urandom(3).hex()
     logger.info(f"[{req}] handle_update start chat_id={chat_id} text={text!r}")
     placeholder_id: int = await send_message(chat_id, "קיבלתי! עובד על זה…")
     stop = asyncio.Event()
     pinger = asyncio.create_task(_typing_pinger(chat_id, stop))
     try:
-        answer: str = await answer_question(text)
+        answer: str = await answer_question(chat_id, text)
         chunks: List[str] = _chunk(answer, MAX_TG_LEN - 50) or ["לא הצלחתי להפיק תשובה."]
         await edit_message_text(chat_id, placeholder_id, chunks[0])
         for extra in chunks[1:]:
@@ -276,7 +354,7 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ) -> Dict[str, str]:
-    """Receives Telegram updates, validates, and schedules asynchronous handling."""
+    """Receives Telegram updates, validates, and schedules asynchronous handling with conversation context."""
     logger.info("Webhook endpoint triggered.")
     if WEBHOOK_SECRET:
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
