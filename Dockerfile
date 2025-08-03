@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 
 COPY main.py /app/main.py
-COPY doc.pdf /app/doc.pdf
+COPY guide_HR.pdf.pdf /app/guide_HR.pdf.pdf
 
 
 ENV HOST=0.0.0.0 PORT=8080
