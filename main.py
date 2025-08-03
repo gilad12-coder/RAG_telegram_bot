@@ -107,21 +107,18 @@ async def answer_question(question: str) -> str:
     logger.info(f"Generating answer for question: '{question}'")
     try:
         file_uri, mime_type = _ensure_file_uploaded()
-        generation_config: types.GenerateContentConfig = types.GenerateContentConfig(
-            temperature=TEMPERATURE,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-            response_mime_type="text/plain",
-        )
-        model: genai.GenerativeModel = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            generation_config=generation_config,
-            system_instruction=SYSTEM_PROMPT,
-        )
-        response: types.GenerateContentResponse = await model.generate_content_async(
-            [
+        response = await genai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_text(text=SYSTEM_PROMPT),
                 types.Part.from_uri(file_uri=file_uri, mime_type=mime_type),
-                types.Part.from_text(f"שאלה: {question}"),
-            ]
+                types.Part.from_text(text=f"שאלה: {question}"),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=TEMPERATURE,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+                response_mime_type="text/plain",
+            ),
         )
         answer: str = (response.text or "").strip() or "לא הצלחתי למצוא תשובה לשאלתך בספר. ייתכן שהמידע אינו קיים או שהשאלה אינה ברורה מספיק."
         logger.info(f"Generated answer: '{answer[:100]}...'")
