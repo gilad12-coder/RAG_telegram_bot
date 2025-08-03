@@ -25,6 +25,9 @@ WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 PDF_PATH: str = os.getenv("PDF_PATH", "./doc.pdf")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+HOST: str = os.getenv("HOST", "0.0.0.0")
+PORT: int = int(os.getenv("PORT", "8080"))
+RELOAD: bool = os.getenv("RELOAD", "false").lower() in ("true", "1", "yes")
 
 FILE_CACHE_HOURS = 24
 HTTP_TIMEOUT = 15.0
@@ -259,3 +262,27 @@ async def telegram_webhook(
             logger.error(f"Failed to send final error message to user {chat_id}: {send_err}", exc_info=True)
             pass
         return {"status": "error", "details": str(e)}
+
+
+if __name__ == "__main__":
+    """
+    Entry point for running the server directly.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        logger.critical("uvicorn is required to run the server. Install it with: pip install uvicorn")
+
+    logger.info(f"Starting server on {HOST}:{PORT} (reload={RELOAD})")
+    logger.info(f"Health check available at: http://{HOST}:{PORT}/healthz")
+    logger.info(f"Webhook endpoint available at: http://{HOST}:{PORT}/webhook")
+    if not os.path.exists(PDF_PATH):
+        logger.warning(f"PDF file not found at {PDF_PATH}. The bot will fail until the file is available.")
+
+    uvicorn.run(
+        "main:app",
+        host=HOST,
+        port=PORT,
+        reload=RELOAD,
+        log_level="info"
+    )
